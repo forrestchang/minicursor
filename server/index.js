@@ -190,7 +190,6 @@ app.post("/api/chat", async (req, res, next) => {
 
       let accumulatedText = "";
       let currentToolUse = null;
-      let toolResults = [];
 
       for await (const event of streamResponse) {
         if (event.type === "content_block_delta") {
@@ -284,7 +283,7 @@ app.post("/api/chat", async (req, res, next) => {
   }
 });
 
-app.use((err, _req, res, _next) => {
+app.use((err, _req, res) => {
   console.error(err);
   res.status(err.status || 500).json({ error: err.message || "Internal error" });
 });
