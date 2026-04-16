@@ -353,8 +353,327 @@ function bootMonaco() {
   });
 }
 
+/* ------------------------ Command Palette ------------------------ */
+
+const palette = {
+  el: null,
+  input: null,
+  list: null,
+  hint: null,
+  open: false,
+  mode: null,         // "file" | "action"
+  items: [],          // current filtered items [{label, hint?, score, indices, run}]
+  selected: 0,
+  fileIndex: null,    // cached [{path}] of all files
+  fileIndexLoading: null,
+};
+
+function buildPalette() {
+  const overlay = document.createElement("div");
+  overlay.className = "palette-overlay";
+  overlay.hidden = true;
+  overlay.innerHTML = `
+    <div class="palette" role="dialog" aria-modal="true">
+      <input class="palette-input" type="text" autocomplete="off" spellcheck="false" />
+      <div class="palette-list" role="listbox"></div>
+      <div class="palette-hint"></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  palette.el = overlay;
+  palette.input = overlay.querySelector(".palette-input");
+  palette.list = overlay.querySelector(".palette-list");
+  palette.hint = overlay.querySelector(".palette-hint");
+
+  overlay.addEventListener("mousedown", (e) => {
+    if (e.target === overlay) closePalette();
+  });
+  palette.input.addEventListener("input", refreshPalette);
+  palette.input.addEventListener("keydown", onPaletteKey);
+  palette.list.addEventListener("mousedown", (e) => {
+    const row = e.target.closest(".palette-row");
+    if (!row) return;
+    e.preventDefault();
+    palette.selected = Number(row.dataset.index);
+    commitSelection();
+  });
+}
+
+function openFilePalette() {
+  openPalette("file", "Go to file…", "↑↓ navigate · Enter open · Esc close");
+  ensureFileIndex();
+  refreshPalette();
+}
+
+function openActionPalette() {
+  openPalette("action", "Run action…", "↑↓ navigate · Enter run · Esc close");
+  refreshPalette();
+}
+
+function openPalette(mode, placeholder, hint) {
+  palette.mode = mode;
+  palette.open = true;
+  palette.el.hidden = false;
+  palette.input.placeholder = placeholder;
+  palette.hint.textContent = hint;
+  palette.input.value = "";
+  palette.selected = 0;
+  palette.input.focus();
+}
+
+function closePalette() {
+  if (!palette.open) return;
+  palette.open = false;
+  palette.el.hidden = true;
+  palette.mode = null;
+  palette.items = [];
+  if (state.editor) state.editor.focus();
+}
+
+function onPaletteKey(e) {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closePalette();
+  } else if (e.key === "ArrowDown") {
+    e.preventDefault();
+    moveSelection(1);
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    moveSelection(-1);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    commitSelection();
+  }
+}
+
+function moveSelection(delta) {
+  if (!palette.items.length) return;
+  palette.selected = (palette.selected + delta + palette.items.length) % palette.items.length;
+  renderPaletteList();
+  const active = palette.list.querySelector(".palette-row.active");
+  active?.scrollIntoView({ block: "nearest" });
+}
+
+function commitSelection() {
+  const item = palette.items[palette.selected];
+  if (!item) return;
+  closePalette();
+  try {
+    item.run();
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+function refreshPalette() {
+  const q = palette.input.value;
+  const source = palette.mode === "file" ? fileCandidates() : actionCandidates();
+  palette.items = filterAndRank(source, q);
+  palette.selected = 0;
+  renderPaletteList();
+}
+
+function renderPaletteList() {
+  palette.list.innerHTML = "";
+  if (!palette.items.length) {
+    const empty = document.createElement("div");
+    empty.className = "palette-empty";
+    if (palette.mode === "file" && !palette.fileIndex) {
+      empty.textContent = "Indexing files…";
+    } else {
+      empty.textContent = "No matches";
+    }
+    palette.list.appendChild(empty);
+    return;
+  }
+  palette.items.forEach((item, i) => {
+    const row = document.createElement("div");
+    row.className = "palette-row" + (i === palette.selected ? " active" : "");
+    row.dataset.index = String(i);
+    row.setAttribute("role", "option");
+    const label = document.createElement("div");
+    label.className = "palette-label";
+    label.innerHTML = highlightMatch(item.label, item.indices);
+    row.appendChild(label);
+    if (item.hint) {
+      const hint = document.createElement("div");
+      hint.className = "palette-row-hint";
+      hint.textContent = item.hint;
+      row.appendChild(hint);
+    }
+    palette.list.appendChild(row);
+  });
+}
+
+function highlightMatch(text, indices) {
+  if (!indices || !indices.length) return escapeHtml(text);
+  const set = new Set(indices);
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = escapeHtml(text[i]);
+    out += set.has(i) ? `<b>${ch}</b>` : ch;
+  }
+  return out;
+}
+
+function fuzzyScore(text, query) {
+  if (!query) return { score: 0, indices: [] };
+  const lt = text.toLowerCase();
+  const lq = query.toLowerCase();
+  const indices = [];
+  let ti = 0;
+  let score = 0;
+  let streak = 0;
+  for (let qi = 0; qi < lq.length; qi++) {
+    const ch = lq[qi];
+    let found = -1;
+    for (let i = ti; i < lt.length; i++) {
+      if (lt[i] === ch) { found = i; break; }
+    }
+    if (found === -1) return null;
+    // Bonuses: word start (sep before) and consecutive streak.
+    const prev = found > 0 ? lt[found - 1] : "/";
+    const atBoundary = /[\/\-_. ]/.test(prev) || found === 0;
+    let gained = 1;
+    if (atBoundary) gained += 3;
+    if (found === ti) { streak++; gained += 2 * streak; } else { streak = 0; }
+    score += gained;
+    indices.push(found);
+    ti = found + 1;
+  }
+  // Prefer shorter strings and matches closer to the basename.
+  score -= text.length * 0.05;
+  const slash = text.lastIndexOf("/");
+  if (indices[0] > slash) score += 5;
+  return { score, indices };
+}
+
+function filterAndRank(items, query) {
+  if (!query.trim()) {
+    return items.slice(0, 200).map((it) => ({ ...it, score: 0, indices: [] }));
+  }
+  const out = [];
+  for (const it of items) {
+    const res = fuzzyScore(it.label, query);
+    if (res) out.push({ ...it, score: res.score, indices: res.indices });
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, 200);
+}
+
+function actionCandidates() {
+  const active = state.activeFile;
+  const actions = [
+    {
+      label: "Save File",
+      hint: "⌘S",
+      run: () => saveActive().catch((e) => alert(`Save failed: ${e.message}`)),
+      enabled: !!active,
+    },
+    {
+      label: "New Chat",
+      hint: "Clear messages",
+      run: () => els.clearChat.click(),
+    },
+    {
+      label: "Toggle Include Current File",
+      hint: els.includeFile.checked ? "currently on" : "currently off",
+      run: () => { els.includeFile.checked = !els.includeFile.checked; },
+    },
+    {
+      label: "Close Current Tab",
+      hint: active || "no file open",
+      run: () => active && closeFile(active),
+      enabled: !!active,
+    },
+    {
+      label: "Close All Tabs",
+      hint: `${state.openFiles.size} open`,
+      run: () => {
+        for (const p of [...state.openFiles.keys()]) closeFile(p);
+      },
+      enabled: state.openFiles.size > 0,
+    },
+    {
+      label: "Open File…",
+      hint: "⌘P",
+      run: () => openFilePalette(),
+    },
+    {
+      label: "Reload File Tree",
+      run: () => {
+        palette.fileIndex = null;
+        palette.fileIndexLoading = null;
+        state.tree.clear();
+        renderRootTree();
+      },
+    },
+    {
+      label: "Focus Chat Input",
+      run: () => els.input.focus(),
+    },
+  ];
+  return actions.filter((a) => a.enabled !== false);
+}
+
+function fileCandidates() {
+  if (!palette.fileIndex) return [];
+  return palette.fileIndex.map((f) => ({
+    label: f.path,
+    run: () => openFile(f.path),
+  }));
+}
+
+function ensureFileIndex() {
+  if (palette.fileIndex || palette.fileIndexLoading) return palette.fileIndexLoading;
+  palette.fileIndexLoading = (async () => {
+    const files = [];
+    const seen = new Set();
+    async function walk(dir) {
+      if (seen.has(dir)) return;
+      seen.add(dir);
+      let entries;
+      try {
+        entries = await api(`/api/tree?path=${encodeURIComponent(dir)}`);
+      } catch {
+        return;
+      }
+      const dirs = [];
+      for (const e of entries) {
+        if (e.type === "file") files.push({ path: e.path });
+        else if (e.type === "dir") dirs.push(e.path);
+      }
+      await Promise.all(dirs.map(walk));
+    }
+    await walk("");
+    files.sort((a, b) => a.path.localeCompare(b.path));
+    palette.fileIndex = files;
+    palette.fileIndexLoading = null;
+    if (palette.open && palette.mode === "file") refreshPalette();
+  })();
+  return palette.fileIndexLoading;
+}
+
+window.addEventListener("keydown", (e) => {
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod || e.altKey || e.shiftKey) return;
+  const key = e.key.toLowerCase();
+  if (key === "p") {
+    e.preventDefault();
+    e.stopPropagation();
+    if (palette.open && palette.mode === "file") closePalette();
+    else openFilePalette();
+  } else if (key === "k") {
+    e.preventDefault();
+    e.stopPropagation();
+    if (palette.open && palette.mode === "action") closePalette();
+    else openActionPalette();
+  }
+}, true);
+
 (async function main() {
   try {
+    buildPalette();
     await loadMeta();
     await bootMonaco();
     await renderRootTree();
