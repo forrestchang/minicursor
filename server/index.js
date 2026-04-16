@@ -105,7 +105,13 @@ Rules:
 - Prefer minimal, surgical changes.
 - If the user's request is ambiguous, ask a clarifying question instead of guessing.`;
 
+function writeSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
 app.post("/api/chat", async (req, res, next) => {
+  let headersSent = false;
   try {
     const { messages, currentFile } = req.body || {};
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -122,24 +128,61 @@ app.post("/api/chat", async (req, res, next) => {
       return { role: m.role, content };
     });
 
-    const response = await client.messages.create({
-      model: MODEL,
-      max_tokens: 4096,
-      system: SYSTEM_PROMPT,
-      messages: normalized,
+    const { data: stream } = await client.messages
+      .create({
+        model: MODEL,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        messages: normalized,
+        stream: true,
+      })
+      .withResponse();
+
+    res.set({
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
     });
-    const text = response.content
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("");
-    res.json({ text, stop_reason: response.stop_reason, usage: response.usage });
+    res.flushHeaders?.();
+    headersSent = true;
+
+    let clientClosed = false;
+    res.on("close", () => {
+      clientClosed = !res.writableEnded;
+      if (clientClosed) stream.controller.abort();
+    });
+
+    let stopReason = null;
+    let usage = null;
+    for await (const event of stream) {
+      if (clientClosed) break;
+      if (event.type === "message_start") {
+        usage = event.message.usage;
+      } else if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+        writeSse(res, "text", { text: event.delta.text });
+      } else if (event.type === "message_delta") {
+        stopReason = event.delta.stop_reason;
+        usage = { ...(usage || {}), ...event.usage };
+      }
+    }
+
+    if (!clientClosed) {
+      writeSse(res, "done", { stop_reason: stopReason, usage });
+      res.end();
+    }
   } catch (err) {
+    if (headersSent) {
+      console.error(`Chat stream failed: ${err.message || "Unknown error"}`);
+      writeSse(res, "error", { error: err.message || "Stream failed" });
+      return res.end();
+    }
     next(err);
   }
 });
 
 app.use((err, _req, res, _next) => {
-  console.error(err);
+  console.error(`Request failed (${err.status || 500}): ${err.message || "Internal error"}`);
   res.status(err.status || 500).json({ error: err.message || "Internal error" });
 });
 

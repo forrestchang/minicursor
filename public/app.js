@@ -214,6 +214,32 @@ function parseAssistantText(text) {
 function appendAssistantMessage(text) {
   const el = document.createElement("div");
   el.className = "msg assistant";
+  renderAssistantContent(el, text);
+  els.messages.appendChild(el);
+  els.messages.scrollTop = els.messages.scrollHeight;
+  return el;
+}
+
+function appendStreamingAssistantMessage() {
+  const el = document.createElement("div");
+  el.className = "msg assistant";
+  els.messages.appendChild(el);
+  els.messages.scrollTop = els.messages.scrollHeight;
+  return el;
+}
+
+function updateStreamingAssistantMessage(el, text) {
+  el.textContent = text;
+  els.messages.scrollTop = els.messages.scrollHeight;
+}
+
+function finalizeAssistantMessage(el, text) {
+  renderAssistantContent(el, text);
+  els.messages.scrollTop = els.messages.scrollHeight;
+}
+
+function renderAssistantContent(el, text) {
+  el.innerHTML = "";
   for (const part of parseAssistantText(text)) {
     if (part.kind === "text") {
       const span = document.createElement("span");
@@ -223,8 +249,6 @@ function appendAssistantMessage(text) {
       el.appendChild(renderEditBlock(part.path, part.content));
     }
   }
-  els.messages.appendChild(el);
-  els.messages.scrollTop = els.messages.scrollHeight;
 }
 
 function renderInlineMarkdown(text) {
@@ -278,27 +302,108 @@ function renderEditBlock(pathRel, content) {
   return block;
 }
 
+function parseSseBuffer(buffer, onEvent) {
+  let match;
+  while ((match = buffer.match(/\r?\n\r?\n/)) !== null) {
+    const rawEvent = buffer.slice(0, match.index);
+    buffer = buffer.slice(match.index + match[0].length);
+    if (!rawEvent.trim()) continue;
+
+    let eventName = "message";
+    const dataLines = [];
+    for (const line of rawEvent.split(/\r?\n/)) {
+      if (line.startsWith("event:")) {
+        eventName = line.slice("event:".length).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice("data:".length).trimStart());
+      }
+    }
+    if (dataLines.length > 0) {
+      onEvent(eventName, JSON.parse(dataLines.join("\n")));
+    }
+  }
+  return buffer;
+}
+
+async function readChatStream(body, onText) {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errorBody = await res.json().catch(() => ({}));
+    throw new Error(errorBody.error || `${res.status} ${res.statusText}`);
+  }
+  if (!res.body) {
+    throw new Error("Streaming is not supported by this browser");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let sawDone = false;
+  let streamError = null;
+
+  const handleEvent = (eventName, data) => {
+    if (eventName === "text") {
+      const delta = data.text || "";
+      text += delta;
+      onText(delta, text);
+    } else if (eventName === "done") {
+      sawDone = true;
+    } else if (eventName === "error") {
+      streamError = new Error(data.error || "Stream failed");
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    buffer = parseSseBuffer(buffer, handleEvent);
+    if (streamError) throw streamError;
+  }
+  buffer += decoder.decode();
+  parseSseBuffer(buffer, handleEvent);
+  if (streamError) throw streamError;
+  if (!sawDone) throw new Error("Connection closed before response finished");
+  return text;
+}
+
 async function sendMessage(text) {
   state.messages.push({ role: "user", content: text });
   appendUserMessage(text);
 
   els.sendBtn.disabled = true;
-  els.sendBtn.textContent = "Thinking…";
+  els.sendBtn.textContent = "Generating...";
 
+  let assistantEl = null;
+  let assistantText = "";
   try {
     const body = { messages: state.messages };
     if (els.includeFile.checked && state.activeFile) {
       const info = state.openFiles.get(state.activeFile);
       body.currentFile = { path: state.activeFile, content: info.model.getValue() };
     }
-    const res = await api("/api/chat", {
-      method: "POST",
-      body: JSON.stringify(body),
+    const responseText = await readChatStream(body, (_delta, currentText) => {
+      if (!assistantEl) assistantEl = appendStreamingAssistantMessage();
+      assistantText = currentText;
+      updateStreamingAssistantMessage(assistantEl, assistantText);
     });
-    state.messages.push({ role: "assistant", content: res.text });
-    appendAssistantMessage(res.text);
+    if (!assistantEl) assistantEl = appendStreamingAssistantMessage();
+    finalizeAssistantMessage(assistantEl, responseText);
+    state.messages.push({ role: "assistant", content: responseText });
   } catch (err) {
-    appendAssistantMessage(`⚠️ ${err.message}`);
+    if (assistantEl) {
+      const errorText = assistantText
+        ? `${assistantText}\n\nError: ${err.message}`
+        : `Error: ${err.message}`;
+      finalizeAssistantMessage(assistantEl, errorText);
+    } else {
+      appendAssistantMessage(`Error: ${err.message}`);
+    }
   } finally {
     els.sendBtn.disabled = false;
     els.sendBtn.textContent = "Send";
