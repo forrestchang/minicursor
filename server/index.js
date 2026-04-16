@@ -90,6 +90,31 @@ app.put("/api/file", async (req, res, next) => {
   }
 });
 
+// Tool use: read file
+async function toolReadFile(relPath) {
+  try {
+    const abs = safeResolve(relPath);
+    const stat = await fs.stat(abs);
+    if (stat.size > MAX_BYTES) {
+      return { error: `File too large (${stat.size} bytes)` };
+    }
+    const content = await fs.readFile(abs, "utf8");
+    return { path: relPath, content };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// Tool use: list directory
+async function toolListDir(relPath) {
+  try {
+    const entries = await listDir(relPath);
+    return { path: relPath || ".", entries };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
 const SYSTEM_PROMPT = `You are MiniCursor, a concise AI pair-programmer embedded in a lightweight code editor.
 
 When the user asks for code changes, respond with a short explanation followed by ONE fenced block per file you want to change, using the exact format:
@@ -105,12 +130,38 @@ Rules:
 - Prefer minimal, surgical changes.
 - If the user's request is ambiguous, ask a clarifying question instead of guessing.`;
 
+const TOOLS = [
+  {
+    name: "read_file",
+    description: "Read the contents of a file at the given path",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the file, relative to project root" }
+      },
+      required: ["path"]
+    }
+  },
+  {
+    name: "list_dir",
+    description: "List files and directories at the given path",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the directory, relative to project root (default: current directory)" }
+      }
+    }
+  }
+];
+
+// Non-streaming chat endpoint (backward compatible)
 app.post("/api/chat", async (req, res, next) => {
   try {
-    const { messages, currentFile } = req.body || {};
+    const { messages, currentFile, stream } = req.body || {};
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages[] required" });
     }
+
     const contextBlock = currentFile?.path
       ? `\n\n<current_file path="${currentFile.path}">\n${currentFile.content ?? ""}\n</current_file>`
       : "";
@@ -122,17 +173,112 @@ app.post("/api/chat", async (req, res, next) => {
       return { role: m.role, content };
     });
 
+    // If streaming requested, use SSE
+    if (stream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      const streamResponse = await client.messages.create({
+        model: MODEL,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        messages: normalized,
+        tools: TOOLS,
+        stream: true,
+      });
+
+      let accumulatedText = "";
+      let currentToolUse = null;
+      let toolResults = [];
+
+      for await (const event of streamResponse) {
+        if (event.type === "content_block_delta") {
+          if (event.delta.type === "text_delta") {
+            const text = event.delta.text;
+            accumulatedText += text;
+            res.write(`data: ${JSON.stringify({ type: "text", content: text })}
+\n\n`);
+          }
+        } else if (event.type === "content_block_start") {
+          if (event.content_block.type === "tool_use") {
+            currentToolUse = {
+              id: event.content_block.id,
+              name: event.content_block.name,
+              input: {}
+            };
+          }
+        } else if (event.type === "input_json_delta") {
+          if (currentToolUse) {
+            // Accumulate partial JSON
+          }
+        } else if (event.type === "content_block_stop") {
+          if (currentToolUse) {
+            // Tool use completed
+          }
+        } else if (event.type === "message_stop") {
+          res.write(`data: ${JSON.stringify({ type: "done" })}
+\n\n`);
+        }
+      }
+
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+
+    // Non-streaming response
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 4096,
       system: SYSTEM_PROMPT,
       messages: normalized,
+      tools: TOOLS,
     });
-    const text = response.content
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("");
-    res.json({ text, stop_reason: response.stop_reason, usage: response.usage });
+
+    // Handle tool use
+    let finalText = "";
+    const toolUses = response.content.filter(b => b.type === "tool_use");
+    const textBlocks = response.content.filter(b => b.type === "text");
+    
+    if (toolUses.length > 0) {
+      // Execute tools and get results
+      const toolResults = [];
+      for (const toolUse of toolUses) {
+        let result;
+        if (toolUse.name === "read_file") {
+          result = await toolReadFile(toolUse.input.path);
+        } else if (toolUse.name === "list_dir") {
+          result = await toolListDir(toolUse.input.path || "");
+        }
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: JSON.stringify(result)
+        });
+      }
+      
+      // Send follow-up with tool results
+      const followUp = await client.messages.create({
+        model: MODEL,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        messages: [
+          ...normalized,
+          { role: "assistant", content: response.content },
+          { role: "user", content: toolResults }
+        ]
+      });
+      
+      finalText = followUp.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("");
+    } else {
+      finalText = textBlocks.map((b) => b.text).join("");
+    }
+    
+    res.json({ text: finalText, stop_reason: response.stop_reason, usage: response.usage });
   } catch (err) {
     next(err);
   }

@@ -11,6 +11,10 @@
   --ok: #4ade80;
   --user-bubble: #2a3350;
   --ai-bubble: #232323;
+  --diff-added: #2d4a3e;
+  --diff-removed: #4a2d2d;
+  --diff-added-text: #7ee787;
+  --diff-removed-text: #ffa198;
 }
 
 * {
@@ -242,6 +246,16 @@ button.primary {
   border: 1px solid var(--border);
 }
 
+.msg.streaming {
+  border-color: var(--accent);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
 .msg pre {
   background: #111;
   border: 1px solid var(--border);
@@ -256,11 +270,17 @@ button.primary {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+/* Edit Block with Diff */
 .edit-block {
   border: 1px solid var(--border);
   border-radius: 6px;
   margin: 8px 0;
   background: #0f1a2e;
+  overflow: hidden;
+}
+
+.edit-block.rejected {
+  opacity: 0.5;
 }
 
 .edit-block .head {
@@ -270,6 +290,7 @@ button.primary {
   padding: 6px 10px;
   border-bottom: 1px solid var(--border);
   font-size: 12px;
+  background: #1a2744;
 }
 
 .edit-block .head .path {
@@ -277,13 +298,21 @@ button.primary {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.edit-block pre {
-  margin: 0;
-  padding: 8px 10px;
-  max-height: 260px;
-  overflow: auto;
-  background: transparent;
-  border: none;
+.edit-block .head .badge {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-left: 4px;
+}
+
+.edit-block .head .badge.new {
+  background: #2d5a27;
+  color: var(--ok);
+}
+
+.edit-block .head .actions {
+  display: flex;
+  gap: 6px;
 }
 
 .edit-block .apply {
@@ -294,10 +323,70 @@ button.primary {
   padding: 2px 10px;
 }
 
+.edit-block .apply:hover:not(:disabled) {
+  background: #3d6bff;
+}
+
+.edit-block .reject {
+  background: transparent;
+  border-color: var(--danger);
+  color: var(--danger);
+  font-size: 12px;
+  padding: 2px 10px;
+}
+
+.edit-block .reject:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+
 .edit-block .apply.done {
   background: #1e3a2b;
   border-color: #2f5c43;
   color: var(--ok);
+}
+
+/* Diff View */
+.diff-view {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.diff-line {
+  display: flex;
+  padding: 1px 8px;
+  white-space: pre;
+}
+
+.diff-line .num {
+  width: 30px;
+  color: var(--fg-muted);
+  text-align: right;
+  margin-right: 12px;
+  flex-shrink: 0;
+}
+
+.diff-line .content {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.diff-line.same {
+  background: transparent;
+}
+
+.diff-line.removed {
+  background: var(--diff-removed);
+  color: var(--diff-removed-text);
+}
+
+.diff-line.added {
+  background: var(--diff-added);
+  color: var(--diff-added-text);
 }
 
 .composer {
@@ -352,4 +441,70 @@ button.primary {
   padding: 12px;
   text-align: center;
   font-size: 12px;
+}
+
+/* Command Palette */
+.palette-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 100px;
+  z-index: 1000;
+}
+
+.palette {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 500px;
+  max-width: 90vw;
+  overflow: hidden;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.palette-input {
+  width: 100%;
+  padding: 12px 16px;
+  background: var(--bg);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 14px;
+  outline: none;
+}
+
+.palette-input::placeholder {
+  color: var(--fg-muted);
+}
+
+.palette-list {
+  max-height: 300px;
+  overflow: auto;
+}
+
+.palette-item {
+  padding: 10px 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.palette-item:hover,
+.palette-item.selected {
+  background: #2a3350;
+}
+
+.palette-item .file-icon,
+.palette-item .cmd-icon {
+  font-size: 12px;
+  width: 20px;
+  text-align: center;
 }

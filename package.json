@@ -1,6 +1,6 @@
 {
   "name": "minicursor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A basic, hackable AI code editor inspired by Cursor. Open a folder, edit files in Monaco, chat with Claude to reason about and patch code.",
   "type": "module",
   "bin": {
@@ -8,13 +8,18 @@
   },
   "scripts": {
     "start": "node server/index.js",
-    "dev": "node --watch server/index.js"
+    "dev": "node --watch server/index.js",
+    "lint": "eslint server/ public/",
+    "test": "node tests/smoke.js"
   },
   "keywords": ["ai", "editor", "cursor", "claude", "anthropic", "ide"],
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.65.0",
     "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
   },
   "engines": {
     "node": ">=18"

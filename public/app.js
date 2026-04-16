@@ -6,6 +6,9 @@ const state = {
   monaco: null,
   editor: null,
   meta: { root: "", model: "" },
+  streaming: false,
+  commandPaletteOpen: false,
+  goToFileOpen: false,
 };
 
 const els = {
@@ -211,9 +214,48 @@ function parseAssistantText(text) {
   return parts;
 }
 
-function appendAssistantMessage(text) {
+// Simple diff algorithm (LCS-based)
+function computeDiff(oldLines, newLines) {
+  const changes = [];
+  let i = 0, j = 0;
+  
+  while (i < oldLines.length || j < newLines.length) {
+    if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
+      changes.push({ type: "same", oldLine: oldLines[i], newLine: newLines[j], oldNum: i + 1, newNum: j + 1 });
+      i++;
+      j++;
+    } else if (i < oldLines.length && (j >= newLines.length || oldLines[i] !== newLines[j])) {
+      changes.push({ type: "removed", oldLine: oldLines[i], oldNum: i + 1 });
+      i++;
+    } else if (j < newLines.length) {
+      changes.push({ type: "added", newLine: newLines[j], newNum: j + 1 });
+      j++;
+    }
+  }
+  
+  return changes;
+}
+
+function appendAssistantMessage(text, streaming = false) {
+  // If streaming, append to last message
+  if (streaming && els.messages.lastElementChild?.classList.contains("streaming")) {
+    const el = els.messages.lastElementChild;
+    el.innerHTML = "";
+    for (const part of parseAssistantText(text)) {
+      if (part.kind === "text") {
+        const span = document.createElement("span");
+        span.innerHTML = renderInlineMarkdown(part.value);
+        el.appendChild(span);
+      } else {
+        el.appendChild(renderEditBlock(part.path, part.content));
+      }
+    }
+    els.messages.scrollTop = els.messages.scrollHeight;
+    return;
+  }
+  
   const el = document.createElement("div");
-  el.className = "msg assistant";
+  el.className = "msg assistant" + (streaming ? " streaming" : "");
   for (const part of parseAssistantText(text)) {
     if (part.kind === "text") {
       const span = document.createElement("span");
@@ -240,14 +282,47 @@ function renderInlineMarkdown(text) {
 function renderEditBlock(pathRel, content) {
   const block = document.createElement("div");
   block.className = "edit-block";
+  
+  // Get current file content for diff
+  let oldContent = "";
+  let isNewFile = false;
+  if (state.openFiles.has(pathRel)) {
+    oldContent = state.openFiles.get(pathRel).model.getValue();
+  } else {
+    isNewFile = true;
+  }
+  
+  const oldLines = oldContent.split("\n");
+  const newLines = content.split("\n");
+  const diff = computeDiff(oldLines, newLines);
+  
+  // Build diff HTML
+  let diffHtml = '<div class="diff-view">';
+  diff.forEach(change => {
+    if (change.type === "same") {
+      diffHtml += `<div class="diff-line same"><span class="num">${change.oldNum}</span><span class="content">${escapeHtml(change.oldLine)}</span></div>`;
+    } else if (change.type === "removed") {
+      diffHtml += `<div class="diff-line removed"><span class="num">${change.oldNum}</span><span class="content">${escapeHtml(change.oldLine)}</span></div>`;
+    } else if (change.type === "added") {
+      diffHtml += `<div class="diff-line added"><span class="num">${change.newNum}</span><span class="content">${escapeHtml(change.newLine)}</span></div>`;
+    }
+  });
+  diffHtml += '</div>';
+  
   block.innerHTML = `
     <div class="head">
-      <span class="path">${escapeHtml(pathRel)}</span>
-      <button class="apply">Apply</button>
+      <span class="path">${escapeHtml(pathRel)}${isNewFile ? ' <span class="badge new">NEW</span>' : ''}</span>
+      <div class="actions">
+        <button class="reject">Reject</button>
+        <button class="apply">Accept</button>
+      </div>
     </div>
-    <pre><code>${escapeHtml(content)}</code></pre>
+    ${diffHtml}
   `;
+  
   const btn = block.querySelector(".apply");
+  const rejectBtn = block.querySelector(".reject");
+  
   btn.addEventListener("click", async () => {
     btn.disabled = true;
     btn.textContent = "Applying…";
@@ -267,14 +342,23 @@ function renderEditBlock(pathRel, content) {
       await renderRootTree();
       btn.textContent = "Applied ✓";
       btn.classList.add("done");
+      rejectBtn.disabled = true;
       renderTabs();
       renderStatus();
     } catch (err) {
       btn.disabled = false;
-      btn.textContent = "Apply";
+      btn.textContent = "Accept";
       alert(`Failed to apply: ${err.message}`);
     }
   });
+  
+  rejectBtn.addEventListener("click", () => {
+    block.classList.add("rejected");
+    btn.disabled = true;
+    rejectBtn.disabled = true;
+    rejectBtn.textContent = "Rejected";
+  });
+  
   return block;
 }
 
@@ -284,24 +368,71 @@ async function sendMessage(text) {
 
   els.sendBtn.disabled = true;
   els.sendBtn.textContent = "Thinking…";
+  state.streaming = true;
 
   try {
-    const body = { messages: state.messages };
+    const body = { messages: state.messages, stream: true };
     if (els.includeFile.checked && state.activeFile) {
       const info = state.openFiles.get(state.activeFile);
       body.currentFile = { path: state.activeFile, content: info.model.getValue() };
     }
-    const res = await api("/api/chat", {
+    
+    // Use streaming
+    const res = await fetch("/api/chat", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    state.messages.push({ role: "assistant", content: res.text });
-    appendAssistantMessage(res.text);
+    
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `${res.status}`);
+    }
+    
+    // Handle SSE stream
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const data = line.slice(6);
+          if (data === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "text") {
+              fullText += parsed.content;
+              appendAssistantMessage(fullText, true);
+            } else if (parsed.type === "done") {
+              state.streaming = false;
+            }
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+    
+    state.messages.push({ role: "assistant", content: fullText });
+    // Remove streaming class
+    const lastMsg = els.messages.lastElementChild;
+    if (lastMsg) lastMsg.classList.remove("streaming");
+    
   } catch (err) {
     appendAssistantMessage(`⚠️ ${err.message}`);
   } finally {
     els.sendBtn.disabled = false;
     els.sendBtn.textContent = "Send";
+    state.streaming = false;
   }
 }
 
@@ -325,6 +456,147 @@ els.clearChat.addEventListener("click", () => {
   els.messages.innerHTML = "";
 });
 
+/* ------------------------ Command Palette ------------------------ */
+
+async function getAllFiles(dir = "", files = []) {
+  try {
+    const entries = await api(`/api/tree?path=${encodeURIComponent(dir)}`);
+    for (const entry of entries) {
+      if (entry.type === "file") {
+        files.push(entry.path);
+      } else if (entry.type === "dir") {
+        await getAllFiles(entry.path, files);
+      }
+    }
+  } catch (e) {
+    // Ignore errors for directories we can't read
+  }
+  return files;
+}
+
+function createPalette(type) {
+  const overlay = document.createElement("div");
+  overlay.className = "palette-overlay";
+  
+  const palette = document.createElement("div");
+  palette.className = "palette";
+  
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = type === "goToFile" ? "Go to file..." : "Type a command...";
+  input.className = "palette-input";
+  
+  const list = document.createElement("div");
+  list.className = "palette-list";
+  
+  palette.appendChild(input);
+  palette.appendChild(list);
+  overlay.appendChild(palette);
+  document.body.appendChild(overlay);
+  
+  let items = [];
+  let selectedIndex = 0;
+  
+  function renderItems() {
+    list.innerHTML = "";
+    items.forEach((item, i) => {
+      const el = document.createElement("div");
+      el.className = "palette-item" + (i === selectedIndex ? " selected" : "");
+      el.innerHTML = type === "goToFile" 
+        ? `<span class="file-icon">📄</span> ${escapeHtml(item)}`
+        : `<span class="cmd-icon">⌘</span> ${escapeHtml(item.label)}`;
+      el.addEventListener("click", () => selectItem(i));
+      list.appendChild(el);
+    });
+  }
+  
+  function selectItem(i) {
+    if (i < 0 || i >= items.length) return;
+    selectedIndex = i;
+    renderItems();
+    
+    if (type === "goToFile") {
+      openFile(items[i]);
+    } else {
+      items[i].action();
+    }
+    close();
+  }
+  
+  function close() {
+    overlay.remove();
+    if (type === "goToFile") {
+      state.goToFileOpen = false;
+    } else {
+      state.commandPaletteOpen = false;
+    }
+  }
+  
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      close();
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      selectedIndex = Math.min(selectedIndex + 1, items.length - 1);
+      renderItems();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      selectedIndex = Math.max(selectedIndex - 1, 0);
+      renderItems();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      selectItem(selectedIndex);
+    }
+  });
+  
+  input.addEventListener("input", () => {
+    const query = input.value.toLowerCase();
+    if (type === "goToFile") {
+      items = allFiles.filter(f => f.toLowerCase().includes(query));
+    } else {
+      items = commands.filter(c => c.label.toLowerCase().includes(query));
+    }
+    selectedIndex = 0;
+    renderItems();
+  });
+  
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  
+  return { input, list, setItems: (i) => { items = i; renderItems(); }, close };
+}
+
+let allFiles = [];
+
+const commands = [
+  { label: "Save File", action: () => saveActive() },
+  { label: "Clear Chat", action: () => { state.messages = []; els.messages.innerHTML = ""; } },
+  { label: "Go to File", action: () => openGoToFile() },
+  { label: "Close Active File", action: () => { if (state.activeFile) closeFile(state.activeFile); } },
+];
+
+async function openGoToFile() {
+  if (state.goToFileOpen) return;
+  state.goToFileOpen = true;
+  
+  const palette = createPalette("goToFile");
+  palette.input.focus();
+  
+  // Load all files
+  allFiles = await getAllFiles();
+  palette.setItems(allFiles);
+}
+
+function openCommandPalette() {
+  if (state.commandPaletteOpen) return;
+  state.commandPaletteOpen = true;
+  
+  const palette = createPalette("command");
+  palette.input.focus();
+  palette.setItems(commands);
+}
+
 /* ------------------------ Monaco ------------------------ */
 
 function bootMonaco() {
@@ -347,6 +619,16 @@ function bootMonaco() {
         // eslint-disable-next-line no-undef
         monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
         () => saveActive().catch((e) => alert(`Save failed: ${e.message}`)),
+      );
+      state.editor.addCommand(
+        // eslint-disable-next-line no-undef
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyP,
+        () => openGoToFile()
+      );
+      state.editor.addCommand(
+        // eslint-disable-next-line no-undef
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK,
+        () => openCommandPalette()
       );
       resolve();
     });
