@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MiniCursor</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="stylesheet"
+      data-name="vs/editor/editor.main"
+      href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/editor/editor.main.css"
+    />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">MiniCursor</div>
+      <div class="meta" id="meta">loading…</div>
+    </header>
+    <main class="layout">
+      <aside class="files" id="files">
+        <div class="files-header">FILES</div>
+        <div class="tree" id="tree"></div>
+      </aside>
+      <section class="editor-wrap">
+        <div class="tabs" id="tabs"></div>
+        <div class="editor" id="editor"></div>
+        <div class="status" id="status">No file open</div>
+      </section>
+      <aside class="chat">
+        <div class="chat-header">
+          <span>CHAT</span>
+          <button id="clearChat" title="New chat">new</button>
+        </div>
+        <div class="messages" id="messages"></div>
+        <form class="composer" id="composer">
+          <textarea
+            id="input"
+            placeholder="Ask Claude to explain or edit the current file… (⌘/Ctrl + Enter)"
+            rows="3"
+          ></textarea>
+          <div class="composer-row">
+            <label class="include-file">
+              <input type="checkbox" id="includeFile" checked />
+              include current file
+            </label>
+            <button id="send" type="submit">Send</button>
+          </div>
+        </form>
+      </aside>
+    </main>
+    <script>
+      var require = { paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs" } };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
