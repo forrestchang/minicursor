@@ -239,43 +239,159 @@ function renderInlineMarkdown(text) {
 
 function renderEditBlock(pathRel, content) {
   const block = document.createElement("div");
-  block.className = "edit-block";
+  block.className = "edit-block pending";
   block.innerHTML = `
     <div class="head">
       <span class="path">${escapeHtml(pathRel)}</span>
-      <button class="apply">Apply</button>
+      <span class="hint">Click to review diff</span>
     </div>
-    <pre><code>${escapeHtml(content)}</code></pre>
   `;
-  const btn = block.querySelector(".apply");
-  btn.addEventListener("click", async () => {
-    btn.disabled = true;
-    btn.textContent = "Applying…";
+  const setState = (kind, label) => {
+    block.classList.remove("pending", "applied", "rejected");
+    block.classList.add(kind);
+    block.querySelector(".hint").textContent = label;
+  };
+  block.addEventListener("click", () => {
+    if (block.classList.contains("applied") || block.classList.contains("rejected")) return;
+    openDiffModal({
+      pathRel,
+      proposed: content,
+      onApplied: () => setState("applied", "Applied ✓"),
+      onRejected: () => setState("rejected", "Rejected"),
+    });
+  });
+  return block;
+}
+
+async function fetchFileOrNull(pathRel) {
+  try {
+    const { content } = await api(`/api/file?path=${encodeURIComponent(pathRel)}`);
+    return content;
+  } catch {
+    return null;
+  }
+}
+
+function openDiffModal({ pathRel, proposed, onApplied, onRejected }) {
+  const overlay = document.createElement("div");
+  overlay.className = "diff-modal-overlay";
+  overlay.innerHTML = `
+    <div class="diff-modal" role="dialog" aria-modal="true">
+      <header class="diff-modal-head">
+        <span class="path">${escapeHtml(pathRel)}</span>
+        <span class="diff-modal-mode" id="diffModalMode">Loading…</span>
+        <div class="actions">
+          <button class="reject" type="button">Reject</button>
+          <button class="apply primary" type="button" disabled>Apply</button>
+          <button class="close" type="button" aria-label="Close">×</button>
+        </div>
+      </header>
+      <div class="diff-modal-body" id="diffModalBody"></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const bodyEl = overlay.querySelector("#diffModalBody");
+  const modeEl = overlay.querySelector("#diffModalMode");
+  const applyBtn = overlay.querySelector(".apply");
+  const rejectBtn = overlay.querySelector(".reject");
+  const closeBtn = overlay.querySelector(".close");
+
+  let editorInstance = null;
+  let createdModels = [];
+
+  const cleanup = () => {
+    document.removeEventListener("keydown", onKey);
+    if (editorInstance) editorInstance.dispose();
+    createdModels.forEach((m) => m.dispose());
+    overlay.remove();
+  };
+  const close = () => cleanup();
+  const reject = () => {
+    onRejected?.();
+    close();
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    }
+  };
+  document.addEventListener("keydown", onKey);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  closeBtn.addEventListener("click", close);
+  rejectBtn.addEventListener("click", reject);
+
+  (async () => {
+    const current = await fetchFileOrNull(pathRel);
+    const isNewFile = current === null;
+    const language = extToLang(pathRel);
+
+    if (isNewFile) {
+      modeEl.textContent = "New file";
+      const model = state.monaco.editor.createModel(proposed, language);
+      createdModels.push(model);
+      editorInstance = state.monaco.editor.create(bodyEl, {
+        model,
+        readOnly: true,
+        theme: "vs-dark",
+        automaticLayout: true,
+        minimap: { enabled: false },
+        fontSize: 13,
+        scrollBeyondLastLine: false,
+      });
+      applyBtn.textContent = "Create file";
+    } else {
+      modeEl.textContent = "Diff against current file";
+      const original = state.monaco.editor.createModel(current, language);
+      const modified = state.monaco.editor.createModel(proposed, language);
+      createdModels.push(original, modified);
+      editorInstance = state.monaco.editor.createDiffEditor(bodyEl, {
+        readOnly: true,
+        renderSideBySide: true,
+        theme: "vs-dark",
+        automaticLayout: true,
+        minimap: { enabled: false },
+        fontSize: 13,
+        scrollBeyondLastLine: false,
+      });
+      editorInstance.setModel({ original, modified });
+    }
+    applyBtn.disabled = false;
+  })().catch((err) => {
+    modeEl.textContent = `Error: ${err.message}`;
+  });
+
+  applyBtn.addEventListener("click", async () => {
+    applyBtn.disabled = true;
+    rejectBtn.disabled = true;
+    const originalLabel = applyBtn.textContent;
+    applyBtn.textContent = "Applying…";
     try {
       await api("/api/file", {
         method: "PUT",
-        body: JSON.stringify({ path: pathRel, content }),
+        body: JSON.stringify({ path: pathRel, content: proposed }),
       });
-      // Refresh editor if file is open
       if (state.openFiles.has(pathRel)) {
         const info = state.openFiles.get(pathRel);
-        info.model.setValue(content);
-        info.savedContent = content;
+        info.model.setValue(proposed);
+        info.savedContent = proposed;
         info.dirty = false;
       }
-      // Reload tree so new files show up
       await renderRootTree();
-      btn.textContent = "Applied ✓";
-      btn.classList.add("done");
       renderTabs();
       renderStatus();
+      onApplied?.();
+      close();
     } catch (err) {
-      btn.disabled = false;
-      btn.textContent = "Apply";
+      applyBtn.disabled = false;
+      rejectBtn.disabled = false;
+      applyBtn.textContent = originalLabel;
       alert(`Failed to apply: ${err.message}`);
     }
   });
-  return block;
 }
 
 async function sendMessage(text) {
